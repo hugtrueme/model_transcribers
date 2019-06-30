@@ -7,21 +7,18 @@ module ModelTranscribers
   extend ActiveSupport::Concern
 
   class_methods do
-    attr_accessor :destination_model, :attr_mapping, :attr_assignment
+    attr_accessor :transcript_model, :attr_mapping, :attr_assignment
 
-    def sync(destination:)
-      self.destination_model = destination
+    def sync(transcript:)
+      # Reset variables
+      self.transcript_model = transcript
       self.attr_mapping = {}
       self.attr_assignment = {}
 
       yield
 
-      sync_method = "sync_to_#{destination.name.underscore}".to_sym
-      define_method(sync_method) do
-        destination_id.present? ? update_destination : create_destination
-      end
-
-      after_save(sync_method)
+      build_association
+      set_after_save_callback
     end
 
     def copy_attr(from:, to:, by: nil)
@@ -34,49 +31,85 @@ module ModelTranscribers
   end
 
   included do
-    def update_destination
-      # Only update the changed attributes.
-      attrubites = saved_changes.keys.each_with_object({}) do |changed_attr, attrs|
-        adapter = self.class.attr_mapping[changed_attr.to_sym]
-        attrs[adapter.destination] = adapter.content_from(self) unless adapter.nil?
+    private_class_method :build_association, :set_after_save_callback
+  end
+
+  # Private class methods
+  class_methods do
+    # Build the association between transcript and progenitor.
+    def build_association
+      has_one :transcript, class_name: transcript_model.name,
+                           foreign_key: 'progenitor_id'
+      progenitor_model = self
+      transcript_model.class_eval do
+        belongs_to :progenitor, class_name: progenitor_model.name,
+                                foreign_key: 'progenitor_id'
       end
-
-      return if attrubites.blank?
-
-      self.class.destination_model.find(destination_id).update_columns(attrubites)
     end
 
-    def create_destination
-      # To create a new destination, we need fill up all attributes we have defined.
-      all_adapters = self.class.attr_mapping.values +
-                     self.class.attr_assignment.values
-
-      attrubites = all_adapters.each_with_object({}) do |adapter, attrs|
-        content = adapter.content_from(self)
-        attrs[adapter.destination] = content if content.present?
+    # Set the "sync_to_xxxxx" method to after_save callback.
+    def set_after_save_callback
+      sync_method = "sync_to_#{transcript_model.name.underscore}".to_sym
+      define_method(sync_method) do
+        transcript.present? ? update_transcript : create_transcript
       end
+      after_save(sync_method)
+    end
+  end
 
-      table = destination_model.table_name
-      created_at = created_at.strftime('%F %T')
-      updated_at = updated_at.strftime('%F %T')
+  private
 
-      sql = "INSERT INTO #{table} (destination_id, created_at, updated_at) "\
-            "VALUES (#{id}, '#{created_at}', '#{updated_at}')"
-      ActiveRecord::Base.connection.execute(sql)
+  def update_transcript
+    # Only update the changed attributes.
+    attrs = saved_changes.keys.each_with_object({}) do |changed_attr, hash|
+      adapter = self.class.attr_mapping[changed_attr.to_sym]
+      hash[adapter.transcript] = adapter.content_from(self) unless adapter.nil?
+    end
 
-      destination = self.class.destination_model.find_by(destination_id: id)
-      destination.update_columns(attrubites)
+    return if attrs.blank?
 
-      update_columns(destination_id: destination.id)
+    transcript.update_columns(attrs)
+  end
+
+  def create_transcript
+    create_transcript_in_raw_sql
+
+    attrubites = all_attrubites_to_be_updated
+    transcript.update_columns(attrubites)
+  end
+
+  def create_transcript_in_raw_sql
+    table = self.class.transcript_model.table_name
+    created_at = self.created_at.strftime('%F %T')
+    updated_at = self.updated_at.strftime('%F %T')
+
+    sql = "INSERT INTO #{table} (progenitor_id, created_at, updated_at) "\
+          "VALUES (#{id}, '#{created_at}', '#{updated_at}')"
+    ActiveRecord::Base.connection.execute(sql)
+
+    # Bacuse we create the transcript by raw sql, so we need to force
+    # database read otherwise the 'self.transcript' would be nil.
+    reload_transcript
+  end
+
+  def all_attrubites_to_be_updated
+    # To create a new transcript, we need fill up all attributes we
+    # have defined.
+    all_adapters = self.class.attr_mapping.values +
+                   self.class.attr_assignment.values
+
+    all_adapters.each_with_object({}) do |adapter, attrubites|
+      content = adapter.content_from(self)
+      attrubites[adapter.transcript] = content if content.present?
     end
   end
 
   #:nodoc:
   class ContentAdapter
-    attr_accessor :destination, :content
+    attr_accessor :transcript, :content
 
-    def initialize(destination, content)
-      @destination = destination
+    def initialize(transcript, content)
+      @transcript = transcript
       @content = content
     end
 
